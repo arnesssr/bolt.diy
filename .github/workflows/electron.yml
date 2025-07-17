@@ -2,6 +2,10 @@ name: Electron Build and Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag for the release (e.g., v1.0.0). Leave empty if not applicable.'
+        required: false
   push:
     branches:
       - electron
@@ -17,7 +21,7 @@ jobs:
     
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest] # TODO: add back macos-latest when notarize is figured out
+        os: [ubuntu-latest, windows-latest, macos-latest] # Use unsigned macOS builds for now
         node-version: [18.18.0]
       fail-fast: false
 
@@ -63,11 +67,6 @@ jobs:
       - name: Build Electron app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           NODE_OPTIONS: "--max_old_space_size=4096"
         run: |
           if [ "$RUNNER_OS" == "Windows" ]; then
@@ -83,7 +82,12 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: ${{ github.event_name == 'workflow_dispatch' || github.ref_type == 'branch' }}
+          # Use the workflow_dispatch input tag if available, else use the Git ref name.
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+          # Only branch pushes remain drafts. For workflow_dispatch and tag pushes the release is published.
+          draft: ${{ github.event_name != 'workflow_dispatch' && github.ref_type == 'branch' }}
+          # For tag pushes, name the release as "Release <tagname>", otherwise "Electron Release".
+          name: ${{ (github.event_name == 'push' && github.ref_type == 'tag') && format('Release {0}', github.ref_name) || 'Electron Release' }}
           files: |
             dist/*.exe
             dist/*.dmg

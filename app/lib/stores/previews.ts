@@ -151,41 +151,6 @@ export class PreviewsStore {
       this._broadcastStorageSync();
     });
 
-    try {
-      // Watch for file changes
-      const watcher = await webcontainer.fs.watch('**/*', { persistent: true });
-
-      // Use the native watch events
-      (watcher as any).addEventListener('change', async () => {
-        const previews = this.previews.get();
-
-        for (const preview of previews) {
-          const previewId = this.getPreviewId(preview.baseUrl);
-
-          if (previewId) {
-            this.broadcastFileChange(previewId);
-          }
-        }
-      });
-
-      // Watch for DOM changes that might affect storage
-      if (typeof window !== 'undefined') {
-        const observer = new MutationObserver((_mutations) => {
-          // Broadcast storage changes when DOM changes
-          this._broadcastStorageSync();
-        });
-
-        observer.observe(document.body, {
-          childList: true,
-          subtree: true,
-          characterData: true,
-          attributes: true,
-        });
-      }
-    } catch (error) {
-      console.error('[Preview] Error setting up watchers:', error);
-    }
-
     // Listen for port events
     webcontainer.on('port', (port, type, url) => {
       let previewInfo = this.#availablePreviews.get(port);
@@ -290,6 +255,18 @@ export class PreviewsStore {
     }, this.#REFRESH_DELAY);
 
     this.#refreshTimeouts.set(previewId, timeout);
+  }
+
+  refreshAllPreviews() {
+    const previews = this.previews.get();
+
+    for (const preview of previews) {
+      const previewId = this.getPreviewId(preview.baseUrl);
+
+      if (previewId) {
+        this.broadcastFileChange(previewId);
+      }
+    }
   }
 }
 

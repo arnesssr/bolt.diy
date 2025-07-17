@@ -8,7 +8,8 @@ import { allowedHTMLElements } from '~/utils/markdown';
 import { LLMManager } from '~/lib/modules/llm/manager';
 import { createScopedLogger } from '~/utils/logger';
 import { createFilesContext, extractPropertiesFromMessage } from './utils';
-import { getFilePaths } from './select-context';
+import { discussPrompt } from '~/lib/common/prompts/discuss-prompt';
+import type { DesignScheme } from '~/types/design-scheme';
 
 export type Messages = Message[];
 
@@ -25,6 +26,14 @@ export interface StreamingOptions extends Omit<Parameters<typeof _streamText>[0]
 
 const logger = createScopedLogger('stream-text');
 
+function sanitizeText(text: string): string {
+  let sanitized = text.replace(/<div class=\\"__boltThought__\\">.*?<\/div>/s, '');
+  sanitized = sanitized.replace(/<think>.*?<\/think>/s, '');
+  sanitized = sanitized.replace(/<boltAction type="file" filePath="package-lock\.json">[\s\S]*?<\/boltAction>/g, '');
+
+  return sanitized.trim();
+}
+
 export async function streamText(props: {
   messages: Omit<Message, 'id'>[];
   env?: Env;
@@ -37,6 +46,8 @@ export async function streamText(props: {
   contextFiles?: FileMap;
   summary?: string;
   messageSliceId?: number;
+  chatMode?: 'discuss' | 'build';
+  designScheme?: DesignScheme;
 }) {
   const {
     messages,
@@ -49,25 +60,31 @@ export async function streamText(props: {
     contextOptimization,
     contextFiles,
     summary,
+    chatMode,
+    designScheme,
   } = props;
   let currentModel = DEFAULT_MODEL;
   let currentProvider = DEFAULT_PROVIDER.name;
   let processedMessages = messages.map((message) => {
+    const newMessage = { ...message };
+
     if (message.role === 'user') {
       const { model, provider, content } = extractPropertiesFromMessage(message);
       currentModel = model;
       currentProvider = provider;
-
-      return { ...message, content };
+      newMessage.content = sanitizeText(content);
     } else if (message.role == 'assistant') {
-      let content = message.content;
-      content = content.replace(/<div class=\\"__boltThought__\\">.*?<\/div>/s, '');
-      content = content.replace(/<think>.*?<\/think>/s, '');
-
-      return { ...message, content };
+      newMessage.content = sanitizeText(message.content);
     }
 
-    return message;
+    // Sanitize all text parts in parts array, if present
+    if (Array.isArray(message.parts)) {
+      newMessage.parts = message.parts.map((part) =>
+        part.type === 'text' ? { ...part, text: sanitizeText(part.text) } : part,
+      );
+    }
+
+    return newMessage;
   });
 
   const provider = PROVIDER_LIST.find((p) => p.name === currentProvider) || DEFAULT_PROVIDER;
@@ -100,12 +117,16 @@ export async function streamText(props: {
   }
 
   const dynamicMaxTokens = modelDetails && modelDetails.maxTokenAllowed ? modelDetails.maxTokenAllowed : MAX_TOKENS;
+  logger.info(
+    `Max tokens for model ${modelDetails.name} is ${dynamicMaxTokens} based on ${modelDetails.maxTokenAllowed} or ${MAX_TOKENS}`,
+  );
 
   let systemPrompt =
     PromptLibrary.getPropmtFromLibrary(promptId || 'default', {
       cwd: WORK_DIR,
       allowedHtmlElements: allowedHTMLElements,
       modificationTagName: MODIFICATIONS_TAG_NAME,
+      designScheme,
       supabase: {
         isConnected: options?.supabaseConnection?.isConnected || false,
         hasSelectedProject: options?.supabaseConnection?.hasSelectedProject || false,
@@ -113,31 +134,26 @@ export async function streamText(props: {
       },
     }) ?? getSystemPrompt();
 
-  if (files && contextFiles && contextOptimization) {
+  if (chatMode === 'build' && contextFiles && contextOptimization) {
     const codeContext = createFilesContext(contextFiles, true);
-    const filePaths = getFilePaths(files);
 
     systemPrompt = `${systemPrompt}
-Below are all the files present in the project:
----
-${filePaths.join('\n')}
----
 
-Below is the artifact containing the context loaded into context buffer for you to have knowledge of and might need changes to fullfill current user request.
-CONTEXT BUFFER:
----
-${codeContext}
----
-`;
+    Below is the artifact containing the context loaded into context buffer for you to have knowledge of and might need changes to fullfill current user request.
+    CONTEXT BUFFER:
+    ---
+    ${codeContext}
+    ---
+    `;
 
     if (summary) {
       systemPrompt = `${systemPrompt}
       below is the chat history till now
-CHAT SUMMARY:
----
-${props.summary}
----
-`;
+      CHAT SUMMARY:
+      ---
+      ${props.summary}
+      ---
+      `;
 
       if (props.messageSliceId) {
         processedMessages = processedMessages.slice(props.messageSliceId);
@@ -151,128 +167,44 @@ ${props.summary}
     }
   }
 
+  const effectiveLockedFilePaths = new Set<string>();
+
+  if (files) {
+    for (const [filePath, fileDetails] of Object.entries(files)) {
+      if (fileDetails?.isLocked) {
+        effectiveLockedFilePaths.add(filePath);
+      }
+    }
+  }
+
+  if (effectiveLockedFilePaths.size > 0) {
+    const lockedFilesListString = Array.from(effectiveLockedFilePaths)
+      .map((filePath) => `- ${filePath}`)
+      .join('\n');
+    systemPrompt = `${systemPrompt}
+
+    IMPORTANT: The following files are locked and MUST NOT be modified in any way. Do not suggest or make any changes to these files. You can proceed with the request but DO NOT make any changes to these files specifically:
+    ${lockedFilesListString}
+    ---
+    `;
+  } else {
+    console.log('No locked files found from any source for prompt.');
+  }
+
   logger.info(`Sending llm call to ${provider.name} with model ${modelDetails.name}`);
 
-  // Store original messages for reference
-  const originalMessages = [...messages];
-  const hasMultimodalContent = originalMessages.some((msg) => Array.isArray(msg.content));
+  // console.log(systemPrompt, processedMessages);
 
-  try {
-    if (hasMultimodalContent) {
-      /*
-       * For multimodal content, we need to preserve the original array structure
-       * but make sure the roles are valid and content items are properly formatted
-       */
-      const multimodalMessages = originalMessages.map((msg) => ({
-        role: msg.role === 'system' || msg.role === 'user' || msg.role === 'assistant' ? msg.role : 'user',
-        content: Array.isArray(msg.content)
-          ? msg.content.map((item) => {
-              // Ensure each content item has the correct format
-              if (typeof item === 'string') {
-                return { type: 'text', text: item };
-              }
-
-              if (item && typeof item === 'object') {
-                if (item.type === 'image' && item.image) {
-                  return { type: 'image', image: item.image };
-                }
-
-                if (item.type === 'text') {
-                  return { type: 'text', text: item.text || '' };
-                }
-              }
-
-              // Default fallback for unknown formats
-              return { type: 'text', text: String(item || '') };
-            })
-          : [{ type: 'text', text: typeof msg.content === 'string' ? msg.content : String(msg.content || '') }],
-      }));
-
-      return await _streamText({
-        model: provider.getModelInstance({
-          model: modelDetails.name,
-          serverEnv,
-          apiKeys,
-          providerSettings,
-        }),
-        system: systemPrompt,
-        maxTokens: dynamicMaxTokens,
-        messages: multimodalMessages as any,
-        ...options,
-      });
-    } else {
-      // For non-multimodal content, we use the standard approach
-      const normalizedTextMessages = processedMessages.map((msg) => ({
-        role: msg.role === 'system' || msg.role === 'user' || msg.role === 'assistant' ? msg.role : 'user',
-        content: typeof msg.content === 'string' ? msg.content : String(msg.content || ''),
-      }));
-
-      return await _streamText({
-        model: provider.getModelInstance({
-          model: modelDetails.name,
-          serverEnv,
-          apiKeys,
-          providerSettings,
-        }),
-        system: systemPrompt,
-        maxTokens: dynamicMaxTokens,
-        messages: convertToCoreMessages(normalizedTextMessages),
-        ...options,
-      });
-    }
-  } catch (error: any) {
-    // Special handling for format errors
-    if (error.message && error.message.includes('messages must be an array of CoreMessage or UIMessage')) {
-      logger.warn('Message format error detected, attempting recovery with explicit formatting...');
-
-      // Create properly formatted messages for all cases as a last resort
-      const fallbackMessages = processedMessages.map((msg) => {
-        // Determine text content with careful type handling
-        let textContent = '';
-
-        if (typeof msg.content === 'string') {
-          textContent = msg.content;
-        } else if (Array.isArray(msg.content)) {
-          // Handle array content safely
-          const contentArray = msg.content as any[];
-          textContent = contentArray
-            .map((contentItem) =>
-              typeof contentItem === 'string'
-                ? contentItem
-                : contentItem?.text || contentItem?.image || String(contentItem || ''),
-            )
-            .join(' ');
-        } else {
-          textContent = String(msg.content || '');
-        }
-
-        return {
-          role: msg.role === 'system' || msg.role === 'user' || msg.role === 'assistant' ? msg.role : 'user',
-          content: [
-            {
-              type: 'text',
-              text: textContent,
-            },
-          ],
-        };
-      });
-
-      // Try one more time with the fallback format
-      return await _streamText({
-        model: provider.getModelInstance({
-          model: modelDetails.name,
-          serverEnv,
-          apiKeys,
-          providerSettings,
-        }),
-        system: systemPrompt,
-        maxTokens: dynamicMaxTokens,
-        messages: fallbackMessages as any,
-        ...options,
-      });
-    }
-
-    // If it's not a format error, re-throw the original error
-    throw error;
-  }
+  return await _streamText({
+    model: provider.getModelInstance({
+      model: modelDetails.name,
+      serverEnv,
+      apiKeys,
+      providerSettings,
+    }),
+    system: chatMode === 'build' ? systemPrompt : discussPrompt(),
+    maxTokens: dynamicMaxTokens,
+    messages: convertToCoreMessages(processedMessages as any),
+    ...options,
+  });
 }
